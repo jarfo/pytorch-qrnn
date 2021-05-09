@@ -97,27 +97,29 @@ class GPUForgetMult(torch.autograd.Function):
     def __init__(self):
         super(GPUForgetMult, self).__init__()
 
-    def compile(self):
-        if self.ptx is None:
-            program = Program(kernel.encode(), 'recurrent_forget_mult.cu'.encode())
+    @staticmethod
+    def compile():
+        if GPUForgetMult.ptx is None:
+            program = Program(kernel, 'recurrent_forget_mult.cu')
             GPUForgetMult.ptx = program.compile()
 
         if torch.cuda.current_device() not in GPUForgetMult.configured_gpus:
             m = function.Module()
-            m.load(bytes(self.ptx.encode()))
+            m.load(bytes(GPUForgetMult.ptx.encode()))
 
-            self.forget_mult = m.get_function('recurrent_forget_mult')
-            self.bwd_forget_mult = m.get_function('bwd_recurrent_forget_mult')
+            forget_mult = m.get_function('recurrent_forget_mult')
+            bwd_forget_mult = m.get_function('bwd_recurrent_forget_mult')
 
             Stream = namedtuple('Stream', ['ptr'])
-            self.stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
+            stream = Stream(ptr=torch.cuda.current_stream().cuda_stream)
 
-            GPUForgetMult.configured_gpus[torch.cuda.current_device()] = (self.forget_mult, self.bwd_forget_mult, self.stream)
+            GPUForgetMult.configured_gpus[torch.cuda.current_device()] = (forget_mult, bwd_forget_mult, stream)
 
-        self.forget_mult, self.bwd_forget_mult, self.stream = GPUForgetMult.configured_gpus[torch.cuda.current_device()]
+        return GPUForgetMult.configured_gpus[torch.cuda.current_device()]
 
-    def forward(self, f, x, hidden_init=None):
-        self.compile()
+    @staticmethod
+    def forward(ctx, f, x, hidden_init=None):
+        forget_mult, _, stream = GPUForgetMult.compile()
         seq_size, batch_size, hidden_size = f.size()
         result = f.new(seq_size + 1, batch_size, hidden_size)
         # We only zero the result array (result[0]) if we don't set a hidden initial state
@@ -127,15 +129,16 @@ class GPUForgetMult(torch.autograd.Function):
         ###
         grid_hidden_size = min(hidden_size, 512)
         grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
-        self.forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
-        self.save_for_backward(f, x, hidden_init)
-        self.result = result
+        forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[result.data_ptr(), f.data_ptr(), x.data_ptr(), seq_size, batch_size, hidden_size], stream=stream)
+        ctx.save_for_backward(f, x, hidden_init)
+        ctx.result = result
         return result[1:, :, :]
 
-    def backward(self, grad_h):
-        self.compile()
-        f, x, hidden_init = self.saved_tensors
-        h = self.result
+    @staticmethod
+    def backward(ctx, grad_h):
+        _, bwd_forget_mult, stream = GPUForgetMult.compile()
+        f, x, hidden_init = ctx.saved_tensors
+        h = ctx.result
         ###
         seq_size, batch_size, hidden_size = f.size()
         # Zeroing is not necessary as these will be overwritten
@@ -145,7 +148,7 @@ class GPUForgetMult(torch.autograd.Function):
         ###
         grid_hidden_size = min(hidden_size, 512)
         grid = (math.ceil(hidden_size / grid_hidden_size), batch_size)
-        self.bwd_forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), seq_size, batch_size, hidden_size], stream=self.stream)
+        bwd_forget_mult(grid=grid, block=(grid_hidden_size, 1), args=[h.data_ptr(), f.data_ptr(), x.data_ptr(), grad_h.data_ptr(), grad_f.data_ptr(), grad_x.data_ptr(), grad_h_init.data_ptr(), seq_size, batch_size, hidden_size], stream=stream)
         ###
         if hidden_init is not None:
             return grad_f, grad_x, grad_h_init
@@ -175,7 +178,7 @@ class ForgetMult(torch.nn.Module):
         if use_cuda: assert f.is_cuda and x.is_cuda, 'GPU ForgetMult with fast element-wise CUDA kernel requested but tensors not on GPU'
         ###
         # Avoiding 'RuntimeError: expected a Variable argument, but got NoneType' when hidden_init is None
-        if hidden_init is None: return GPUForgetMult()(f, x) if use_cuda else CPUForgetMult()(f, x)
+        if hidden_init is None: return GPUForgetMult.apply(f, x) if use_cuda else CPUForgetMult()(f, x)
         return GPUForgetMult()(f, x, hidden_init) if use_cuda else CPUForgetMult()(f, x, hidden_init)
 
 ###
